@@ -114,7 +114,7 @@ def main():
     script_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
     os.chdir(script_dir)
 
-    config_file = "config.example.json"
+    config_file = "config.json"
     with open(config_file, 'r') as f:
         config = json.load(f)
 

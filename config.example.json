@@ -1,0 +1,4 @@
+{
+  "GITHUB_TOKEN": "github access token (fine grained recommended)",
+  "ORG_NAME": "fill your organization name"
+}

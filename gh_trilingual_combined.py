@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 import os
 import sys
@@ -30,32 +29,51 @@ def ensure_local_clone(repo_name: str, clone_url: str, dest_root: str, token: st
         auth_url = clone_url.replace("https://", f"https://{token}@")
     if os.path.exists(dest) and os.path.isdir(os.path.join(dest, ".git")):
         run(["git", "remote", "set-url", "origin", auth_url], cwd=dest)
-        run(["git", "fetch", "--all", "--prune"], cwd=dest)
+        # fetch everything, prune, and tags for completeness
+        run(["git", "fetch", "--all", "--prune", "--tags"], cwd=dest)
+        # also fetch PR heads into refs/remotes/origin/pr/* (harmless if none)
+        try:
+            run(["git", "fetch", "origin", "+refs/pull/*/head:refs/remotes/origin/pr/*"], cwd=dest)
+        except Exception:
+            pass
     else:
         os.makedirs(dest_root, exist_ok=True)
         run(["git", "clone", "--no-tags", "--quiet", auth_url, dest])
-        run(["git", "fetch", "--all", "--prune"], cwd=dest)
+        run(["git", "fetch", "--all", "--prune", "--tags"], cwd=dest)
+        try:
+            run(["git", "fetch", "origin", "+refs/pull/*/head:refs/remotes/origin/pr/*"], cwd=dest)
+        except Exception:
+            pass
     return dest
 
-def list_local_branches(repo_path: str) -> List[str]:
-    out = run(["git", "for-each-ref", "--format=%(refname:short)", "refs/heads"], cwd=repo_path)
+def list_all_branches(repo_path: str) -> List[str]:
+    """
+    Return both local and remote-tracking branches (origin/*), excluding symbolic origin/HEAD.
+    """
+    out = run(
+        ["git", "for-each-ref", "--format=%(refname:short)", "refs/heads", "refs/remotes/origin"],
+        cwd=repo_path
+    )
     branches = [ln.strip() for ln in out.splitlines() if ln.strip()]
+    branches = [b for b in branches if b != "origin/HEAD"]
     return branches
 
 def commits_by_branch(repo_path: str, branches: Iterable[str]) -> Tuple[Dict[str, List[str]], List[str]]:
+    """
+    Build a mapping from commit SHA -> list of branch names that contain it,
+    and return a deduped list of all commits reachable from all refs (git rev-list --all).
+    """
     sha_to_branches: Dict[str, List[str]] = defaultdict(list)
-    seen = set()
     for br in branches:
         out = run(["git", "rev-list", br], cwd=repo_path)
         for sha in out.splitlines():
-            if not sha:
-                continue
-            sha_to_branches[sha].append(br)
-            if sha not in seen:
-                seen.add(sha)
-    # de-duplicated, consistent order
-    all_out = run(["git", "rev-list", "--all"], cwd=repo_path)
-    all_unique = [sha for sha in all_out.splitlines() if sha in seen]
+            if sha:
+                sha_to_branches[sha].append(br)
+
+    # Use the full all-refs traversal order; do NOT restrict to seen SHAs.
+    all_unique = run(["git", "rev-list", "--all"], cwd=repo_path).splitlines()
+    # keep only real SHAs (defensive, though rev-list emits SHAs)
+    all_unique = [s for s in all_unique if s]
     return sha_to_branches, all_unique
 
 def parse_numstat(repo_path: str, sha: str):
@@ -167,16 +185,17 @@ def main():
             })
     pd.DataFrame(branches_rows).to_csv(os.path.join(output_folder, "branches.csv"), index=False)
 
-    # commits.csv (local git, de-duped)
+    # commits.csv (local git, de-duped, ALL refs)
     commits_rows = []
     for repo in repos:
         print(f"[Commits: local git] {repo.name}")
         try:
             repo_path = ensure_local_clone(repo.name, repo.clone_url, local_root, token=GITHUB_TOKEN)
-            local_branches = list_local_branches(repo_path)
+
+            local_branches = list_all_branches(repo_path)
             if not local_branches:
                 run(["git", "checkout", repo.default_branch], cwd=repo_path)
-                local_branches = list_local_branches(repo_path)
+                local_branches = list_all_branches(repo_path)
 
             branch_map, all_commits = commits_by_branch(repo_path, local_branches)
 

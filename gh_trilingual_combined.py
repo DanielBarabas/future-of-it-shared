@@ -105,6 +105,94 @@ def parse_name_status(repo_path: str, sha: str):
             })
     return changed
 
+def get_all_commit_data(repo_path: str, commits: List[str]) -> Dict[str, Dict]:
+    """Get all commit data in three batched git calls instead of 3*N calls per commit."""
+    if not commits:
+        return {}
+    
+    # First call: get commit headers (include merge commits to match commits_by_branch)
+    fmt = "%H|%an|%ae|%ad|%s"
+    cmd = ["git", "log", f"--format={fmt}", "--date=iso-strict"] + commits
+    header_out = run(cmd, cwd=repo_path)
+    
+    # Second call: get numstat (include merge commits)
+    cmd = ["git", "log", "--format=%H", "--numstat"] + commits
+    numstat_out = run(cmd, cwd=repo_path)
+    
+    # Third call: get name-status (include merge commits)
+    cmd = ["git", "log", "--format=%H", "--name-status"] + commits
+    status_out = run(cmd, cwd=repo_path)
+    
+    # Parse headers first
+    result = {}
+    for line in header_out.splitlines():
+        if "|" in line and len(line.split("|")) >= 5:
+            parts = line.split("|", 4)  # Split into max 5 parts, keeping any extra pipes in the subject
+            sha = parts[0]
+            result[sha] = {
+                "author_name": parts[1],
+                "author_email": parts[2], 
+                "author_date": parts[3],
+                "subject": parts[4],  # This can contain additional pipes
+                "changed_files": [],
+                "total_adds": 0,
+                "total_dels": 0
+            }
+    
+    # Parse numstat (store per-SHA numstat data)
+    current_sha = None
+    sha_numstat = {}
+    
+    for line in numstat_out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        # Check if this is a commit SHA (40 hex chars)
+        if len(line) == 40 and all(c in '0123456789abcdef' for c in line.lower()):
+            current_sha = line
+            sha_numstat[current_sha] = {}
+        elif current_sha and "\t" in line:
+            parts = line.split("\t")
+            if len(parts) == 3:
+                # Numstat line: additions, deletions, filename
+                adds, dels, fname = parts
+                try:
+                    adds_i = int(adds) if adds.isdigit() else 0
+                    dels_i = int(dels) if dels.isdigit() else 0
+                except:
+                    adds_i, dels_i = 0, 0
+                sha_numstat[current_sha][fname] = (adds_i, dels_i)
+                if current_sha in result:
+                    result[current_sha]["total_adds"] += adds_i
+                    result[current_sha]["total_dels"] += dels_i
+    
+    # Parse name-status and combine with numstat
+    current_sha = None
+    
+    for line in status_out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        # Check if this is a commit SHA (40 hex chars)
+        if len(line) == 40 and all(c in '0123456789abcdef' for c in line.lower()):
+            current_sha = line
+        elif current_sha and current_sha in result and "\t" in line:
+            parts = line.split("\t")
+            if len(parts) == 2:
+                # Name-status line: status, filename
+                status, filename = parts
+                # Get numstat data for this file from stored data
+                adds, dels = sha_numstat.get(current_sha, {}).get(filename, (0, 0))
+                result[current_sha]["changed_files"].append({
+                    "filename": filename,
+                    "status": status,
+                    "additions": adds,
+                    "deletions": dels,
+                    "changes": adds + dels,
+                })
+    
+    return result
+
 def commit_header(repo_path: str, sha: str):
     fmt = "%H|%an|%ae|%ad|%s"
     out = run(["git", "show", "-s", f"--format={fmt}", "--date=iso-strict", sha], cwd=repo_path)
@@ -189,13 +277,40 @@ def main():
 
             branch_map, all_commits = commits_by_branch(repo_path, local_branches)
 
+            # Batch process all commit data 
+            print(f"  processing {len(all_commits)} commits in batch...")
+            commit_data = get_all_commit_data(repo_path, all_commits)
+            
+            individual_calls = 0
             for i, sha in enumerate(all_commits, 1):
-                if i % 1000 == 0:
-                    print(f"  processed {i}/{len(all_commits)} commits...", flush=True)
                 try:
-                    author_name, author_email, author_date, subject = commit_header(repo_path, sha)
-                    changed_files = parse_name_status(repo_path, sha)
-                    total_adds, total_dels, _ = parse_numstat(repo_path, sha)
+                    data = commit_data.get(sha, {})
+                    if data:
+                        # Use all batched data
+                        author_name = data["author_name"]
+                        author_email = data["author_email"]
+                        author_date = data["author_date"]
+                        subject = data["subject"]
+                        changed_files = data["changed_files"]
+                        total_adds = data["total_adds"]
+                        total_dels = data["total_dels"]
+                    else:
+                        # Fallback to individual calls
+                        individual_calls += 1
+                        if individual_calls <= 5:  # Log first few failures for debugging
+                            print(f"\r  DEBUG: batch miss for {sha[:8]} (#{individual_calls})")
+                            print(f"    Total parsed commits in batch: {len(commit_data)}")
+                            print(f"    Expected total commits: {len(all_commits)}")
+                            # Check if this SHA is in the beginning or end of the list
+                            sha_pos = all_commits.index(sha) if sha in all_commits else -1
+                            print(f"    SHA position in list: {sha_pos}")
+                        author_name, author_email, author_date, subject = commit_header(repo_path, sha)
+                        changed_files = parse_name_status(repo_path, sha)
+                        total_adds, total_dels, _ = parse_numstat(repo_path, sha)
+                    
+                    # Running counter with carriage return
+                    print(f"\r  processed: {i}/{len(all_commits)} (individual: {individual_calls})", end="", flush=True)
+                    
                     commits_rows.append({
                         "repo": repo.full_name,
                         "sha": sha,
@@ -211,8 +326,11 @@ def main():
                         "changed_files": json.dumps(changed_files),
                     })
                 except Exception as e:
-                    print(f"    error on {sha[:8]}: {e}")
+                    print(f"\r    error on {sha[:8]}: {e}")
                     continue
+            
+            # Complete the progress line
+            print()  # newline after carriage return progress
         except Exception as e:
             print(f"  failed on repo {repo.name}: {e}")
             continue

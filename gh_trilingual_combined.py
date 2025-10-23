@@ -29,21 +29,11 @@ def ensure_local_clone(repo_name: str, clone_url: str, dest_root: str, token: st
         auth_url = clone_url.replace("https://", f"https://{token}@")
     if os.path.exists(dest) and os.path.isdir(os.path.join(dest, ".git")):
         run(["git", "remote", "set-url", "origin", auth_url], cwd=dest)
-        # fetch everything, prune, and tags for completeness
-        run(["git", "fetch", "--all", "--prune", "--tags"], cwd=dest)
-        # also fetch PR heads into refs/remotes/origin/pr/* (harmless if none)
-        try:
-            run(["git", "fetch", "origin", "+refs/pull/*/head:refs/remotes/origin/pr/*"], cwd=dest)
-        except Exception:
-            pass
+        run(["git", "fetch", "--all", "--prune"], cwd=dest)
     else:
         os.makedirs(dest_root, exist_ok=True)
         run(["git", "clone", "--no-tags", "--quiet", auth_url, dest])
-        run(["git", "fetch", "--all", "--prune", "--tags"], cwd=dest)
-        try:
-            run(["git", "fetch", "origin", "+refs/pull/*/head:refs/remotes/origin/pr/*"], cwd=dest)
-        except Exception:
-            pass
+        run(["git", "fetch", "--all", "--prune"], cwd=dest)
     return dest
 
 def list_all_branches(repo_path: str) -> List[str]:

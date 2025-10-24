@@ -4,6 +4,7 @@ import sys
 import re
 import json
 import subprocess
+import time
 from collections import defaultdict
 from typing import Dict, List, Tuple, Iterable
 
@@ -115,12 +116,12 @@ def get_all_commit_data(repo_path: str, commits: List[str]) -> Dict[str, Dict]:
     cmd = ["git", "log", f"--format={fmt}", "--date=iso-strict"] + commits
     header_out = run(cmd, cwd=repo_path)
     
-    # Second call: get numstat (include merge commits)
-    cmd = ["git", "log", "--format=%H", "--numstat"] + commits
+    # Second call: get numstat (include merge commits with -m flag)
+    cmd = ["git", "log", "-m", "--format=%H", "--numstat"] + commits
     numstat_out = run(cmd, cwd=repo_path)
     
-    # Third call: get name-status (include merge commits)
-    cmd = ["git", "log", "--format=%H", "--name-status"] + commits
+    # Third call: get name-status (include merge commits with -m flag)
+    cmd = ["git", "log", "-m", "--format=%H", "--name-status"] + commits
     status_out = run(cmd, cwd=repo_path)
     
     # Parse headers first
@@ -139,9 +140,11 @@ def get_all_commit_data(repo_path: str, commits: List[str]) -> Dict[str, Dict]:
                 "total_dels": 0
             }
     
-    # Parse numstat (store per-SHA numstat data)
+    # Parse numstat (store per-SHA numstat data, only first occurrence for merge commits)
     current_sha = None
     sha_numstat = {}
+    seen_shas = set()  # Track which SHAs we've already processed
+    processing_first_occurrence = False  # Track if we're in first occurrence of current SHA
     
     for line in numstat_out.splitlines():
         line = line.strip()
@@ -150,8 +153,14 @@ def get_all_commit_data(repo_path: str, commits: List[str]) -> Dict[str, Dict]:
         # Check if this is a commit SHA (40 hex chars)
         if len(line) == 40 and all(c in '0123456789abcdef' for c in line.lower()):
             current_sha = line
-            sha_numstat[current_sha] = {}
-        elif current_sha and "\t" in line:
+            # Only process first occurrence of each SHA (merge commits appear multiple times with -m)
+            if current_sha not in seen_shas:
+                seen_shas.add(current_sha)
+                sha_numstat[current_sha] = {}
+                processing_first_occurrence = True
+            else:
+                processing_first_occurrence = False
+        elif current_sha and processing_first_occurrence and "\t" in line:
             parts = line.split("\t")
             if len(parts) == 3:
                 # Numstat line: additions, deletions, filename
@@ -166,8 +175,10 @@ def get_all_commit_data(repo_path: str, commits: List[str]) -> Dict[str, Dict]:
                     result[current_sha]["total_adds"] += adds_i
                     result[current_sha]["total_dels"] += dels_i
     
-    # Parse name-status and combine with numstat
+    # Parse name-status and combine with numstat (only first occurrence for merge commits)
     current_sha = None
+    seen_shas_status = set()  # Track which SHAs we've already processed for name-status
+    processing_first_occurrence_status = False  # Track if we're in first occurrence of current SHA
     
     for line in status_out.splitlines():
         line = line.strip()
@@ -176,7 +187,13 @@ def get_all_commit_data(repo_path: str, commits: List[str]) -> Dict[str, Dict]:
         # Check if this is a commit SHA (40 hex chars)
         if len(line) == 40 and all(c in '0123456789abcdef' for c in line.lower()):
             current_sha = line
-        elif current_sha and current_sha in result and "\t" in line:
+            # Only process first occurrence of each SHA (merge commits appear multiple times with -m)
+            if current_sha not in seen_shas_status:
+                seen_shas_status.add(current_sha)
+                processing_first_occurrence_status = True
+            else:
+                processing_first_occurrence_status = False
+        elif current_sha and current_sha in result and processing_first_occurrence_status and "\t" in line:
             parts = line.split("\t")
             if len(parts) == 2:
                 # Name-status line: status, filename
@@ -189,6 +206,22 @@ def get_all_commit_data(repo_path: str, commits: List[str]) -> Dict[str, Dict]:
                     "additions": adds,
                     "deletions": dels,
                     "changes": adds + dels,
+                })
+            elif len(parts) == 3:
+                # Rename/copy line: status, old_filename, new_filename
+                status, old_filename, new_filename = parts
+                # For renames, use the new filename and get stats for both old and new names
+                adds_old, dels_old = sha_numstat.get(current_sha, {}).get(old_filename, (0, 0))
+                adds_new, dels_new = sha_numstat.get(current_sha, {}).get(new_filename, (0, 0))
+                # Use the sum of both (though for pure renames this is usually 0,0)
+                total_adds = adds_old + adds_new
+                total_dels = dels_old + dels_new
+                result[current_sha]["changed_files"].append({
+                    "filename": new_filename,
+                    "status": status,
+                    "additions": total_adds,
+                    "deletions": total_dels,
+                    "changes": total_adds + total_dels,
                 })
     
     return result
@@ -207,6 +240,8 @@ def commit_header(repo_path: str, sha: str):
 # -------------------------
 
 def main():
+    start_time = time.time()
+    
     script_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
     os.chdir(script_dir)
 
@@ -304,6 +339,7 @@ def main():
                             # Check if this SHA is in the beginning or end of the list
                             sha_pos = all_commits.index(sha) if sha in all_commits else -1
                             print(f"    SHA position in list: {sha_pos}")
+                    
                         author_name, author_email, author_date, subject = commit_header(repo_path, sha)
                         changed_files = parse_name_status(repo_path, sha)
                         total_adds, total_dels, _ = parse_numstat(repo_path, sha)
@@ -421,6 +457,13 @@ def main():
             analyzer.save_results(results, dep_file)
         except Exception as e:
             print(f"Dependency analysis failed for {repo.name}: {e}")
+    
+    # Print elapsed time
+    end_time = time.time()
+    elapsed_seconds = int(end_time - start_time)
+    elapsed_minutes = elapsed_seconds // 60
+    elapsed_seconds = elapsed_seconds % 60
+    print(f"Elapsed time: {elapsed_minutes}m {elapsed_seconds}s")
 
 if __name__ == "__main__":
     main()

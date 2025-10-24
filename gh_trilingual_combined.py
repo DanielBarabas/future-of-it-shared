@@ -337,11 +337,17 @@ def main():
 
     pd.DataFrame(commits_rows).to_csv(os.path.join(output_folder, "commits.csv"), index=False)
 
-    # pull_requests.csv
+    # pull_requests.csv and pr_comments.csv (combined to avoid duplicate API calls)
     pulls_rows = []
+    pr_comments_rows = []
+    
     for repo in repos:
-        print(f"[Pull Requests] {repo.name}")
-        for pr in repo.get_pulls(state='all'):
+        print(f"[Pull Requests & Comments] {repo.name}")
+        # Fetch PRs once and use for both datasets
+        prs = list(repo.get_pulls(state='all'))
+        
+        for pr in prs:
+            # Collect PR data
             pulls_rows.append({
                 "repo": repo.full_name,
                 "number": pr.number,
@@ -350,13 +356,8 @@ def main():
                 "merged_at": pr.merged_at,
                 "files_impacted": getattr(pr, "changed_files", None)
             })
-    pd.DataFrame(pulls_rows).to_csv(os.path.join(output_folder, "pull_requests.csv"), index=False)
-
-    # pr_comments.csv
-    pr_comments_rows = []
-    for repo in repos:
-        print(f"[PR Comments] {repo.name}")
-        for pr in repo.get_pulls(state='all'):
+            
+            # Collect PR comments
             for comment in pr.get_issue_comments():
                 pr_comments_rows.append({
                     "repo": repo.full_name,
@@ -374,6 +375,8 @@ def main():
                     "position": review_comment.position,
                     "type": "review"
                 })
+    
+    pd.DataFrame(pulls_rows).to_csv(os.path.join(output_folder, "pull_requests.csv"), index=False)
     pd.DataFrame(pr_comments_rows).to_csv(os.path.join(output_folder, "pr_comments.csv"), index=False)
 
     # issues.csv

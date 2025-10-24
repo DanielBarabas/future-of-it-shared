@@ -162,29 +162,20 @@ class GitCommitAnalyzer:
         )
 
     def get_batched_file_data(self, commits: List[str]) -> Dict[str, Dict]:
-        """Get file listings for all commits in one git call."""
+        """Get file listings using individual git ls-tree calls (correct behavior, limited batching)."""
         if not commits:
             return {}
         
-        # Get all files for all commits at once
-        cmd = ["git", "log", "--name-only", "--format=%H"] + commits
-        out = run(cmd, cwd=self.repo_path)
-        
         result = {}
-        current_sha = None
-        
-        for line in out.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            # Check if this is a commit SHA (40 hex chars)
-            if len(line) == 40 and all(c in '0123456789abcdef' for c in line):
-                current_sha = line
-                result[current_sha] = {"files": []}
-            elif current_sha and line:
-                # Filter for relevant file types early
-                if (line.lower().endswith(('.ts', '.tsx', '.js', '.jsx', '.swift'))):
-                    result[current_sha]["files"].append(line)
+        for sha in commits:
+            try:
+                # Use git ls-tree to get ALL files that exist at this commit (like the original)
+                out = run(["git", "ls-tree", "-r", "--name-only", sha], cwd=self.repo_path)
+                all_files = [ln.strip() for ln in out.splitlines() if ln.strip()]
+                # Store ALL files (not just TS/JS/Swift) to match original behavior
+                result[sha] = {"files": all_files}
+            except Exception:
+                result[sha] = {"files": []}
         
         return result
 
@@ -196,6 +187,9 @@ class GitCommitAnalyzer:
         # Batch get file listings for all commits
         print(f"[deps] getting file listings for {len(commits)} commits in batch...")
         batched_files = self.get_batched_file_data(commits)
+        print(f"[deps] batched files found for {len(batched_files)} commits")
+        if len(batched_files) < len(commits):
+            print(f"[deps] WARNING: Missing {len(commits) - len(batched_files)} commits in batch result")
         
         results: List[Dict] = []
         for i, sha in enumerate(commits, 1):

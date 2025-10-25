@@ -161,82 +161,21 @@ class GitCommitAnalyzer:
             swift_imports=swift_imports,
         )
 
-    def get_batched_file_data(self, commits: List[str]) -> Dict[str, Dict]:
-        """Get file listings using individual git ls-tree calls (correct behavior, limited batching)."""
-        if not commits:
-            return {}
-        
-        result = {}
-        for sha in commits:
-            try:
-                # Use git ls-tree to get ALL files that exist at this commit (like the original)
-                out = run(["git", "ls-tree", "-r", "--name-only", sha], cwd=self.repo_path)
-                all_files = [ln.strip() for ln in out.splitlines() if ln.strip()]
-                # Store ALL files (not just TS/JS/Swift) to match original behavior
-                result[sha] = {"files": all_files}
-            except Exception:
-                result[sha] = {"files": []}
-        
-        return result
-
     def analyze_all_commits(self, limit: Optional[int] = None) -> List[Dict]:
         commits = self.list_all_commits()
         if limit:
             commits = commits[:limit]
-        
-        # Batch get file listings for all commits
-        print(f"[deps] getting file listings for {len(commits)} commits in batch...")
-        batched_files = self.get_batched_file_data(commits)
-        print(f"[deps] batched files found for {len(batched_files)} commits")
-        if len(batched_files) < len(commits):
-            print(f"[deps] WARNING: Missing {len(commits) - len(batched_files)} commits in batch result")
-        
         results: List[Dict] = []
         for i, sha in enumerate(commits, 1):
             if i % 500 == 0:
                 print(f"[deps] processed {i}/{len(commits)} commits...")
-            
-            # Use batched file data if available, otherwise fallback
-            batch_data = batched_files.get(sha, {})
-            if batch_data and "files" in batch_data:
-                relevant_files = batch_data["files"]
-            else:
-                print(f"[deps] fallback to individual file listing for {sha[:8]}")
-                all_files = self.list_files_at_commit(sha)
-                relevant_files = [f for f in all_files if (
-                    self.is_typescript_file(f) or self.is_javascript_file(f) or self.is_swift_file(f)
-                )]
-            
-            # Process imports for filtered files
-            ts_imports: Dict[str, List[str]] = {}
-            js_imports: Dict[str, List[str]] = {}
-            swift_imports: Dict[str, List[str]] = {}
-
-            for fp in relevant_files:
-                try:
-                    content = self.get_file_content_at_commit(sha, fp)
-                    if content:
-                        if self.is_typescript_file(fp):
-                            mods = self.extract_typescript_imports(content)
-                            if mods:
-                                ts_imports[fp] = sorted(mods)
-                        elif self.is_javascript_file(fp):
-                            mods = self.extract_javascript_imports(content)
-                            if mods:
-                                js_imports[fp] = sorted(mods)
-                        elif self.is_swift_file(fp):
-                            mods = self.extract_swift_imports(content)
-                            if mods:
-                                swift_imports[fp] = sorted(mods)
-                except Exception:
-                    continue
-
+            res = self.analyze_commit(sha)
             results.append({
-                "sha": sha,
-                "files": relevant_files,
-                "typescript_imports": ts_imports,
-                "javascript_imports": js_imports,
-                "swift_imports": swift_imports,
+                "sha": res.sha,
+                "files": res.files,
+                "typescript_imports": res.typescript_imports,
+                "javascript_imports": res.javascript_imports,
+                "swift_imports": res.swift_imports,
             })
         return results
 

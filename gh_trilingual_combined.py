@@ -4,6 +4,7 @@ import sys
 import re
 import json
 import subprocess
+import time
 from collections import defaultdict
 from typing import Dict, List, Tuple, Iterable
 
@@ -115,6 +116,126 @@ def parse_name_status(repo_path: str, sha: str):
             })
     return changed
 
+def get_all_commit_data(repo_path: str, commits: List[str]) -> Dict[str, Dict]:
+    """Get all commit data in three batched git calls instead of 3*N calls per commit."""
+    if not commits:
+        return {}
+    
+    # First call: get commit headers (include merge commits to match commits_by_branch)
+    fmt = "%H|%an|%ae|%ad|%s"
+    cmd = ["git", "log", f"--format={fmt}", "--date=iso-strict"] + commits
+    header_out = run(cmd, cwd=repo_path)
+    
+    # Second call: get numstat (include merge commits with -m flag)
+    cmd = ["git", "log", "-m", "--format=%H", "--numstat"] + commits
+    numstat_out = run(cmd, cwd=repo_path)
+    
+    # Third call: get name-status (include merge commits with -m flag)
+    cmd = ["git", "log", "-m", "--format=%H", "--name-status"] + commits
+    status_out = run(cmd, cwd=repo_path)
+    
+    # Parse headers first
+    result = {}
+    for line in header_out.splitlines():
+        if "|" in line and len(line.split("|")) >= 5:
+            parts = line.split("|", 4)  # Split into max 5 parts, keeping any extra pipes in the subject
+            sha = parts[0]
+            result[sha] = {
+                "author_name": parts[1],
+                "author_email": parts[2], 
+                "author_date": parts[3],
+                "subject": parts[4],  # This can contain additional pipes
+                "changed_files": [],
+                "total_adds": 0,
+                "total_dels": 0
+            }
+    
+    # Parse numstat (store per-SHA numstat data, only first occurrence for merge commits)
+    current_sha = None
+    sha_numstat = {}
+    seen_shas = set()  # Track which SHAs we've already processed
+    processing_first_occurrence = False  # Track if we're in first occurrence of current SHA
+    
+    for line in numstat_out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        # Check if this is a commit SHA (40 hex chars)
+        if len(line) == 40 and all(c in '0123456789abcdef' for c in line.lower()):
+            current_sha = line
+            # Only process first occurrence of each SHA (merge commits appear multiple times with -m)
+            if current_sha not in seen_shas:
+                seen_shas.add(current_sha)
+                sha_numstat[current_sha] = {}
+                processing_first_occurrence = True
+            else:
+                processing_first_occurrence = False
+        elif current_sha and processing_first_occurrence and "\t" in line:
+            parts = line.split("\t")
+            if len(parts) == 3:
+                # Numstat line: additions, deletions, filename
+                adds, dels, fname = parts
+                try:
+                    adds_i = int(adds) if adds.isdigit() else 0
+                    dels_i = int(dels) if dels.isdigit() else 0
+                except:
+                    adds_i, dels_i = 0, 0
+                sha_numstat[current_sha][fname] = (adds_i, dels_i)
+                if current_sha in result:
+                    result[current_sha]["total_adds"] += adds_i
+                    result[current_sha]["total_dels"] += dels_i
+    
+    # Parse name-status and combine with numstat (only first occurrence for merge commits)
+    current_sha = None
+    seen_shas_status = set()  # Track which SHAs we've already processed for name-status
+    processing_first_occurrence_status = False  # Track if we're in first occurrence of current SHA
+    
+    for line in status_out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        # Check if this is a commit SHA (40 hex chars)
+        if len(line) == 40 and all(c in '0123456789abcdef' for c in line.lower()):
+            current_sha = line
+            # Only process first occurrence of each SHA (merge commits appear multiple times with -m)
+            if current_sha not in seen_shas_status:
+                seen_shas_status.add(current_sha)
+                processing_first_occurrence_status = True
+            else:
+                processing_first_occurrence_status = False
+        elif current_sha and current_sha in result and processing_first_occurrence_status and "\t" in line:
+            parts = line.split("\t")
+            if len(parts) == 2:
+                # Name-status line: status, filename
+                status, filename = parts
+                # Get numstat data for this file from stored data
+                adds, dels = sha_numstat.get(current_sha, {}).get(filename, (0, 0))
+                result[current_sha]["changed_files"].append({
+                    "filename": filename,
+                    "status": status,
+                    "additions": adds,
+                    "deletions": dels,
+                    "changes": adds + dels,
+                })
+            elif len(parts) == 3:
+                # Rename/copy line: status, old_filename, new_filename
+                status, old_filename, new_filename = parts
+                # For renames, use the new filename and get stats for both old and new names
+                adds_old, dels_old = sha_numstat.get(current_sha, {}).get(old_filename, (0, 0))
+                adds_new, dels_new = sha_numstat.get(current_sha, {}).get(new_filename, (0, 0))
+                # Use the sum of both (though for pure renames this is usually 0,0)
+                total_adds = adds_old + adds_new
+                total_dels = dels_old + dels_new
+                result[current_sha]["changed_files"].append({
+                    "filename": new_filename,
+                    "status": status,
+                    "additions": total_adds,
+                    "deletions": total_dels,
+                    "changes": total_adds + total_dels,
+                })
+    
+    return result
+
 def commit_header(repo_path: str, sha: str):
     fmt = "%H|%an|%ae|%ad|%s"
     out = run(["git", "show", "-s", f"--format={fmt}", "--date=iso-strict", sha], cwd=repo_path)
@@ -129,6 +250,8 @@ def commit_header(repo_path: str, sha: str):
 # -------------------------
 
 def main():
+    start_time = time.time()
+    
     script_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
     os.chdir(script_dir)
 
@@ -199,13 +322,41 @@ def main():
 
             branch_map, all_commits = commits_by_branch(repo_path, local_branches)
 
+            # Batch process all commit data 
+            print(f"  processing {len(all_commits)} commits in batch...")
+            commit_data = get_all_commit_data(repo_path, all_commits)
+            
+            individual_calls = 0
             for i, sha in enumerate(all_commits, 1):
-                if i % 1000 == 0:
-                    print(f"  processed {i}/{len(all_commits)} commits...", flush=True)
                 try:
-                    author_name, author_email, author_date, subject = commit_header(repo_path, sha)
-                    changed_files = parse_name_status(repo_path, sha)
-                    total_adds, total_dels, _ = parse_numstat(repo_path, sha)
+                    data = commit_data.get(sha, {})
+                    if data:
+                        # Use all batched data
+                        author_name = data["author_name"]
+                        author_email = data["author_email"]
+                        author_date = data["author_date"]
+                        subject = data["subject"]
+                        changed_files = data["changed_files"]
+                        total_adds = data["total_adds"]
+                        total_dels = data["total_dels"]
+                    else:
+                        # Fallback to individual calls
+                        individual_calls += 1
+                        if individual_calls <= 5:  # Log first few failures for debugging
+                            print(f"\r  DEBUG: batch miss for {sha[:8]} (#{individual_calls})")
+                            print(f"    Total parsed commits in batch: {len(commit_data)}")
+                            print(f"    Expected total commits: {len(all_commits)}")
+                            # Check if this SHA is in the beginning or end of the list
+                            sha_pos = all_commits.index(sha) if sha in all_commits else -1
+                            print(f"    SHA position in list: {sha_pos}")
+                    
+                        author_name, author_email, author_date, subject = commit_header(repo_path, sha)
+                        changed_files = parse_name_status(repo_path, sha)
+                        total_adds, total_dels, _ = parse_numstat(repo_path, sha)
+                    
+                    # Running counter with carriage return
+                    print(f"\r  processed: {i}/{len(all_commits)} (individual: {individual_calls})", end="", flush=True)
+                    
                     commits_rows.append({
                         "repo": repo.full_name,
                         "sha": sha,
@@ -221,19 +372,28 @@ def main():
                         "changed_files": json.dumps(changed_files),
                     })
                 except Exception as e:
-                    print(f"    error on {sha[:8]}: {e}")
+                    print(f"\r    error on {sha[:8]}: {e}")
                     continue
+            
+            # Complete the progress line
+            print()  # newline after carriage return progress
         except Exception as e:
             print(f"  failed on repo {repo.name}: {e}")
             continue
 
     pd.DataFrame(commits_rows).to_csv(os.path.join(output_folder, "commits.csv"), index=False)
 
-    # pull_requests.csv
+    # pull_requests.csv and pr_comments.csv (combined to avoid duplicate API calls)
     pulls_rows = []
+    pr_comments_rows = []
+    
     for repo in repos:
-        print(f"[Pull Requests] {repo.name}")
-        for pr in repo.get_pulls(state='all'):
+        print(f"[Pull Requests & Comments] {repo.name}")
+        # Fetch PRs once and use for both datasets
+        prs = list(repo.get_pulls(state='all'))
+        
+        for pr in prs:
+            # Collect PR data
             pulls_rows.append({
                 "repo": repo.full_name,
                 "number": pr.number,
@@ -242,13 +402,8 @@ def main():
                 "merged_at": pr.merged_at,
                 "files_impacted": getattr(pr, "changed_files", None)
             })
-    pd.DataFrame(pulls_rows).to_csv(os.path.join(output_folder, "pull_requests.csv"), index=False)
-
-    # pr_comments.csv
-    pr_comments_rows = []
-    for repo in repos:
-        print(f"[PR Comments] {repo.name}")
-        for pr in repo.get_pulls(state='all'):
+            
+            # Collect PR comments
             for comment in pr.get_issue_comments():
                 pr_comments_rows.append({
                     "repo": repo.full_name,
@@ -266,6 +421,8 @@ def main():
                     "position": review_comment.position,
                     "type": "review"
                 })
+    
+    pd.DataFrame(pulls_rows).to_csv(os.path.join(output_folder, "pull_requests.csv"), index=False)
     pd.DataFrame(pr_comments_rows).to_csv(os.path.join(output_folder, "pr_comments.csv"), index=False)
 
     # issues.csv
@@ -310,6 +467,13 @@ def main():
             analyzer.save_results(results, dep_file)
         except Exception as e:
             print(f"Dependency analysis failed for {repo.name}: {e}")
+    
+    # Print elapsed time
+    end_time = time.time()
+    elapsed_seconds = int(end_time - start_time)
+    elapsed_minutes = elapsed_seconds // 60
+    elapsed_seconds = elapsed_seconds % 60
+    print(f"Elapsed time: {elapsed_minutes}m {elapsed_seconds}s")
 
 if __name__ == "__main__":
     main()

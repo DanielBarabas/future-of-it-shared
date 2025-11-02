@@ -2,3 +2,7 @@ gh_outputs
 linear_outputs
 slack_outputs
 config.json
+*.ipynb
+__pycache__
+gh_outputs_notebook
+one_pass_stream_outputs

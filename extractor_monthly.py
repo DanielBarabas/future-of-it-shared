@@ -6,6 +6,7 @@ import subprocess
 from dataclasses import dataclass
 from typing import Dict, List, Set, Optional
 from pathlib import Path
+from datetime import datetime
 
 # -------------------------
 # Utilities (UTF-8 safe)
@@ -92,11 +93,46 @@ class GitCommitAnalyzer:
             sha = sha.strip(); ad = ad.strip()
             if not sha or not ad:
                 continue
-            month_key = ad[:7]  # "YYYY-MM"
+            # "YYYY-MM"
+            month_key = ad[:7]
             if month_key not in latest_by_month:
                 latest_by_month[month_key] = sha
 
         return list(latest_by_month.values())  # newest months first
+
+    def list_weekly_latest_commits(self, branch: Optional[str] = None) -> List[str]:
+        """
+        One commit per ISO week (YYYY-Www), selecting the latest commit in each week.
+        Git prints newest first, so first hit per week is the winner.
+        """
+        fmt = r"%H|%ad"
+        if branch:
+            log_out = run(["git", "log", branch, "--date=iso-strict", f"--pretty=format:{fmt}"], cwd=self.repo_path)
+        else:
+            log_out = run(["git", "log", "--all", "--date=iso-strict", f"--pretty=format:{fmt}"], cwd=self.repo_path)
+
+        latest_by_week: Dict[str, str] = {}
+
+        for line in log_out.splitlines():
+            if "|" not in line:
+                continue
+            sha, ad = line.split("|", 1)
+            sha = sha.strip(); ad = ad.strip()
+            if not sha or not ad:
+                continue
+            # Parse ISO date with TZ; robust to trailing 'Z'
+            try:
+                ad_norm = ad.replace("Z", "+00:00")
+                dt = datetime.fromisoformat(ad_norm)
+            except Exception:
+                # Fallback: take first 10 chars YYYY-MM-DD (ignores time/tz)
+                dt = datetime.strptime(ad[:10], "%Y-%m-%d")
+            iso_year, iso_week, _ = dt.isocalendar()
+            week_key = f"{iso_year}-W{iso_week:02d}"
+            if week_key not in latest_by_week:
+                latest_by_week[week_key] = sha
+
+        return list(latest_by_week.values())  # newest weeks first
 
     # ------------ file helpers ------------
     def list_files_at_commit(self, sha: str) -> List[str]:
@@ -130,7 +166,7 @@ class GitCommitAnalyzer:
         r"(?:(?:import\s+[^;]+?from\s+['\"]([^'\"]+)['\"])|(?:import\s+['\"]([^'\"]+)['\"]))",
         re.MULTILINE,
     )
-    js_import_re = ts_import_re  # same for most cases
+    js_import_re = ts_import_re
     swift_import_re = re.compile(r"^\s*import\s+([A-Za-z0-9_\.]+)", re.MULTILINE)
 
     @classmethod
@@ -149,7 +185,6 @@ class GitCommitAnalyzer:
             mod = m.group(1) or m.group(2)
             if mod:
                 imports.add(mod)
-        # CommonJS require()
         for m in re.finditer(r"require\(\s*['\"]([^'\"]+)['\"]\s*\)", text):
             imports.add(m.group(1))
         return imports
@@ -230,8 +265,10 @@ if __name__ == "__main__":
     parser.add_argument("repo", help="HTTPS clone URL")
     parser.add_argument("--out", default="deps.json", help="Output JSON file")
     parser.add_argument("--limit", type=int, default=None, help="Optional commit limit for testing")
+    parser.add_argument("--weekly", action="store_true",
+                        help="Analyze one commit per ISO week (latest in each week).")
     parser.add_argument("--monthly", action="store_true",
-                        help="Analyze one commit per calendar month (latest in each YYYY-MM) instead of every commit.")
+                        help="Analyze one commit per calendar month (latest in each month).")
     parser.add_argument("--branch", default=None,
                         help="Limit analysis to a single branch (e.g., 'main'). If omitted, use all refs.")
     parser.add_argument("--workdir", default="deps_work",
@@ -240,8 +277,10 @@ if __name__ == "__main__":
 
     analyzer = GitCommitAnalyzer(args.repo, workdir=args.workdir)
 
-    # Choose commits
-    if args.monthly:
+    # Choose commits: weekly > monthly > all
+    if args.weekly:
+        selected_commits = analyzer.list_weekly_latest_commits(branch=args.branch)
+    elif args.monthly:
         selected_commits = analyzer.list_monthly_latest_commits(branch=args.branch)
     else:
         selected_commits = analyzer.list_all_commits(branch=args.branch)
@@ -250,7 +289,7 @@ if __name__ == "__main__":
         selected_commits = selected_commits[:args.limit]
 
     print(f"[deps] Selected {len(selected_commits)} commit(s) "
-          f"({'monthly latest' if args.monthly else 'all'}) "
+          f"{'(weekly latest)' if args.weekly else '(monthly latest)' if args.monthly else '(all)'} "
           f"{'on ' + args.branch if args.branch else 'on all refs'}")
 
     results = analyzer.analyze_commits(selected_commits)

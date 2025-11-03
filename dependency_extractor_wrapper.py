@@ -27,8 +27,8 @@ for r in org.get_repos():
     if not r.private:     
         continue
     repo_url = r.clone_url
-    out = os.path.join(outdir, f"{r.name}.deps.json")
+    out = os.path.join(outdir, f"{r.name}_deps_weekly.json")
     subprocess.check_call([
         "python", "extractor_monthly.py", repo_url,
-        "--monthly","--out", str(out),
+        "--weekly","--out", str(out),
     ])

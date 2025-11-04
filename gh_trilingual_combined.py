@@ -284,34 +284,49 @@ def main():
     } for repo in repos]
     pd.DataFrame(repo_rows).to_csv(os.path.join(output_folder, "repositories.csv"), index=False)
 
-    # contributors.csv
-    contributors_rows = []
+    # contributors.csv (per-repo)
     for repo in repos:
+        contributors_file = os.path.join(output_folder, f"{repo.name}_contributors.csv")
+        if os.path.exists(contributors_file):
+            print(f"[Contributors] {repo.name} - output file already exists, skipping: {contributors_file}")
+            continue
+            
         print(f"[Contributors] {repo.name}")
+        contributors_rows = []
         for contributor in repo.get_contributors():
             contributors_rows.append({
                 "repo": repo.full_name,
                 "login": contributor.login if contributor else None,
                 "contributions": getattr(contributor, "contributions", None)
             })
-    pd.DataFrame(contributors_rows).to_csv(os.path.join(output_folder, "contributors.csv"), index=False)
+        pd.DataFrame(contributors_rows).to_csv(contributors_file, index=False)
 
-    # branches.csv (reference)
-    branches_rows = []
+    # branches.csv (per-repo)
     for repo in repos:
+        branches_file = os.path.join(output_folder, f"{repo.name}_branches.csv")
+        if os.path.exists(branches_file):
+            print(f"[Branches] {repo.name} - output file already exists, skipping: {branches_file}")
+            continue
+            
         print(f"[Branches] {repo.name}")
+        branches_rows = []
         for branch in repo.get_branches():
             branches_rows.append({
                 "repo": repo.full_name,
                 "branch": branch.name,
                 "commit_sha": branch.commit.sha
             })
-    pd.DataFrame(branches_rows).to_csv(os.path.join(output_folder, "branches.csv"), index=False)
+        pd.DataFrame(branches_rows).to_csv(branches_file, index=False)
 
-    # commits.csv (local git, de-duped, ALL refs)
-    commits_rows = []
+    # commits.csv (per-repo, local git, de-duped, ALL refs)
     for repo in repos:
+        commits_file = os.path.join(output_folder, f"{repo.name}_commits.csv")
+        if os.path.exists(commits_file):
+            print(f"[Commits: local git] {repo.name} - output file already exists, skipping: {commits_file}")
+            continue
+            
         print(f"[Commits: local git] {repo.name}")
+        commits_rows = []
         try:
             repo_path = ensure_local_clone(repo.name, repo.clone_url, local_root, token=GITHUB_TOKEN)
 
@@ -377,18 +392,26 @@ def main():
             
             # Complete the progress line
             print()  # newline after carriage return progress
+            
+            # Save per-repo commits file
+            pd.DataFrame(commits_rows).to_csv(commits_file, index=False)
         except Exception as e:
             print(f"  failed on repo {repo.name}: {e}")
             continue
 
-    pd.DataFrame(commits_rows).to_csv(os.path.join(output_folder, "commits.csv"), index=False)
-
-    # pull_requests.csv and pr_comments.csv (combined to avoid duplicate API calls)
-    pulls_rows = []
-    pr_comments_rows = []
-    
+    # pull_requests.csv and pr_comments.csv (per-repo, combined to avoid duplicate API calls)
     for repo in repos:
+        pulls_file = os.path.join(output_folder, f"{repo.name}_pull_requests.csv")
+        pr_comments_file = os.path.join(output_folder, f"{repo.name}_pr_comments.csv")
+        
+        if os.path.exists(pulls_file) and os.path.exists(pr_comments_file):
+            print(f"[Pull Requests & Comments] {repo.name} - output files already exist, skipping: {pulls_file}, {pr_comments_file}")
+            continue
+            
         print(f"[Pull Requests & Comments] {repo.name}")
+        pulls_rows = []
+        pr_comments_rows = []
+        
         # Fetch PRs once and use for both datasets
         prs = list(repo.get_pulls(state='all'))
         total_prs = len(prs)
@@ -426,14 +449,20 @@ def main():
                 })
         
         print()  # New line after progress tracking
-    
-    pd.DataFrame(pulls_rows).to_csv(os.path.join(output_folder, "pull_requests.csv"), index=False)
-    pd.DataFrame(pr_comments_rows).to_csv(os.path.join(output_folder, "pr_comments.csv"), index=False)
+        
+        # Save per-repo files
+        pd.DataFrame(pulls_rows).to_csv(pulls_file, index=False)
+        pd.DataFrame(pr_comments_rows).to_csv(pr_comments_file, index=False)
 
-    # issues.csv
-    issues_rows = []
+    # issues.csv (per-repo)
     for repo in repos:
+        issues_file = os.path.join(output_folder, f"{repo.name}_issues.csv")
+        if os.path.exists(issues_file):
+            print(f"[Issues] {repo.name} - output file already exists, skipping: {issues_file}")
+            continue
+            
         print(f"[Issues] {repo.name}")
+        issues_rows = []
         for issue in repo.get_issues(state='all'):
             issues_rows.append({
                 "repo": repo.full_name,
@@ -446,12 +475,17 @@ def main():
                 "created_at": issue.created_at,
                 "closed_at": issue.closed_at
             })
-    pd.DataFrame(issues_rows).to_csv(os.path.join(output_folder, "issues.csv"), index=False)
+        pd.DataFrame(issues_rows).to_csv(issues_file, index=False)
 
-    # issue_comments.csv
-    issue_comments_rows = []
+    # issue_comments.csv (per-repo)
     for repo in repos:
+        issue_comments_file = os.path.join(output_folder, f"{repo.name}_issue_comments.csv")
+        if os.path.exists(issue_comments_file):
+            print(f"[Issue Comments] {repo.name} - output file already exists, skipping: {issue_comments_file}")
+            continue
+            
         print(f"[Issue Comments] {repo.name}")
+        issue_comments_rows = []
         for issue in repo.get_issues(state='all'):
             for comment in issue.get_comments():
                 issue_comments_rows.append({
@@ -460,15 +494,19 @@ def main():
                     "user.login": comment.user.login if comment.user else None,
                     "created_at": comment.created_at
                 })
-    pd.DataFrame(issue_comments_rows).to_csv(os.path.join(output_folder, "issue_comments.csv"), index=False)
+        pd.DataFrame(issue_comments_rows).to_csv(issue_comments_file, index=False)
 
-    # dependency analysis (local, reuses analyzer)
+    # dependency analysis (per-repo, local, reuses analyzer)
     for repo in repos:
+        dep_file = os.path.join(output_folder, f"{repo.name}_deps.json")
+        if os.path.exists(dep_file):
+            print(f"[Dependency Analysis] {repo.name} - output file already exists, skipping: {dep_file}")
+            continue
+            
         print(f"[Dependency Analysis] {repo.name}")
         analyzer = GitCommitAnalyzer(repo.clone_url)
         try:
             results = analyzer.analyze_all_commits()
-            dep_file = os.path.join(output_folder, f"{repo.name}_deps.json")
             analyzer.save_results(results, dep_file)
         except Exception as e:
             print(f"Dependency analysis failed for {repo.name}: {e}")

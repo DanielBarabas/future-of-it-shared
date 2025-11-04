@@ -353,12 +353,28 @@ def main():
         try:
             repo_path = ensure_local_clone(repo.name, repo.clone_url, local_root, token=GITHUB_TOKEN)
 
+            # Check if repository is empty (has no commits)
+            try:
+                run(["git", "rev-parse", "HEAD"], cwd=repo_path)
+            except RuntimeError:
+                print(f"  repository is empty (no commits), skipping")
+                continue
+
             local_branches = list_all_branches(repo_path)
             if not local_branches:
-                run(["git", "checkout", repo.default_branch], cwd=repo_path)
-                local_branches = list_all_branches(repo_path)
+                try:
+                    run(["git", "checkout", repo.default_branch], cwd=repo_path)
+                    local_branches = list_all_branches(repo_path)
+                except RuntimeError:
+                    print(f"  failed to checkout default branch '{repo.default_branch}', repository may be empty")
+                    continue
 
             branch_map, all_commits = commits_by_branch(repo_path, local_branches)
+            
+            # Double-check: if no commits found, skip
+            if not all_commits:
+                print(f"  no commits found in repository, skipping")
+                continue
 
             # Batch process all commit data in chunks
             print(f"  processing {len(all_commits)} commits in batches of {COMMIT_BATCH_SIZE}...")

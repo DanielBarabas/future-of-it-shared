@@ -496,20 +496,20 @@ def main():
                 })
         pd.DataFrame(issue_comments_rows).to_csv(issue_comments_file, index=False)
 
-    # dependency analysis (per-repo, local, reuses analyzer)
-    for repo in repos:
-        dep_file = os.path.join(output_folder, f"{repo.name}_deps.json")
-        if os.path.exists(dep_file):
-            print(f"[Dependency Analysis] {repo.name} - output file already exists, skipping: {dep_file}")
-            continue
-            
-        print(f"[Dependency Analysis] {repo.name}")
-        analyzer = GitCommitAnalyzer(repo.clone_url)
-        try:
-            results = analyzer.analyze_all_commits()
-            analyzer.save_results(results, dep_file)
-        except Exception as e:
-            print(f"Dependency analysis failed for {repo.name}: {e}")
+    # dependency analysis (per-repo, local, reuses analyzer) - COMMENTED OUT, using separate monthly script
+    # for repo in repos:
+    #     dep_file = os.path.join(output_folder, f"{repo.name}_deps.json")
+    #     if os.path.exists(dep_file):
+    #         print(f"[Dependency Analysis] {repo.name} - output file already exists, skipping: {dep_file}")
+    #         continue
+    #         
+    #     print(f"[Dependency Analysis] {repo.name}")
+    #     analyzer = GitCommitAnalyzer(repo.clone_url)
+    #     try:
+    #         results = analyzer.analyze_all_commits()
+    #         analyzer.save_results(results, dep_file)
+    #     except Exception as e:
+    #         print(f"Dependency analysis failed for {repo.name}: {e}")
     
     # Print elapsed time
     end_time = time.time()

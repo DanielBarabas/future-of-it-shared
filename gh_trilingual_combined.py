@@ -116,8 +116,31 @@ def parse_name_status(repo_path: str, sha: str):
             })
     return changed
 
-def get_all_commit_data(repo_path: str, commits: List[str]) -> Dict[str, Dict]:
-    """Get all commit data in three batched git calls instead of 3*N calls per commit."""
+# Batch size constant for processing commits
+COMMIT_BATCH_SIZE = 1000
+
+def get_commit_data_chunked(repo_path: str, commits: List[str]) -> Dict[str, Dict]:
+    """Get all commit data in chunked batches to avoid 'Argument list too long' errors."""
+    if not commits:
+        return {}
+    
+    all_results = {}
+    total_commits = len(commits)
+    
+    # Process commits in chunks
+    for i in range(0, total_commits, COMMIT_BATCH_SIZE):
+        chunk = commits[i:i + COMMIT_BATCH_SIZE]
+        chunk_end = min(i + COMMIT_BATCH_SIZE, total_commits)
+        print(f"\r    processing batch {i//COMMIT_BATCH_SIZE + 1}/{(total_commits + COMMIT_BATCH_SIZE - 1)//COMMIT_BATCH_SIZE} (commits {i+1}-{chunk_end})...", end="", flush=True)
+        
+        chunk_results = get_single_batch_commit_data(repo_path, chunk)
+        all_results.update(chunk_results)
+    
+    print()  # New line after batch processing
+    return all_results
+
+def get_single_batch_commit_data(repo_path: str, commits: List[str]) -> Dict[str, Dict]:
+    """Get commit data for a single batch of commits."""
     if not commits:
         return {}
     
@@ -337,9 +360,9 @@ def main():
 
             branch_map, all_commits = commits_by_branch(repo_path, local_branches)
 
-            # Batch process all commit data 
-            print(f"  processing {len(all_commits)} commits in batch...")
-            commit_data = get_all_commit_data(repo_path, all_commits)
+            # Batch process all commit data in chunks
+            print(f"  processing {len(all_commits)} commits in batches of {COMMIT_BATCH_SIZE}...")
+            commit_data = get_commit_data_chunked(repo_path, all_commits)
             
             individual_calls = 0
             for i, sha in enumerate(all_commits, 1):

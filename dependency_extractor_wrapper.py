@@ -28,6 +28,11 @@ for r in org.get_repos():
         continue
     repo_url = r.clone_url
     out = os.path.join(outdir, f"{r.name}_deps_weekly.json")
+    
+    if os.path.exists(out):
+        print(f"Output file already exists for {r.name}, skipping: {out}")
+        continue
+    
     subprocess.check_call([
         "python", "extractor_monthly.py", repo_url,
         "--weekly","--out", str(out),

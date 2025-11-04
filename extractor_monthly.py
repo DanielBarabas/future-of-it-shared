@@ -233,9 +233,9 @@ class GitCommitAnalyzer:
 
     def analyze_commits(self, commits: List[str]) -> List[Dict]:
         results: List[Dict] = []
+        total = len(commits)
         for i, sha in enumerate(commits, 1):
-            if i % 500 == 0:
-                print(f"[deps] processed {i}/{len(commits)} commits...")
+            print(f"\r[deps] processed {i}/{total} commits...", end="", flush=True)
             res = self.analyze_commit(sha)
             results.append({
                 "sha": res.sha,
@@ -244,6 +244,7 @@ class GitCommitAnalyzer:
                 "javascript_imports": res.javascript_imports,
                 "swift_imports": res.swift_imports,
             })
+        print()  # New line after progress tracking
         return results
 
     @staticmethod

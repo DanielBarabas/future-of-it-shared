@@ -6,12 +6,63 @@ import json
 import subprocess
 import time
 from collections import defaultdict
-from typing import Dict, List, Tuple, Iterable
+from typing import Dict, List, Tuple, Iterable, Callable, Any
 
 import pandas as pd
 from github import Github
+from github.GithubException import GithubException
+import requests.exceptions
+import urllib3.exceptions
 
 from extractor_trilingual import GitCommitAnalyzer
+
+# -------------------------
+# Network retry utilities
+# -------------------------
+
+def retry_network_operation(operation: Callable, max_wait_seconds: int = 60, initial_delay: float = 1.0, backoff_factor: float = 2.0) -> Any:
+    """
+    Retry a network operation with exponential backoff until it succeeds.
+    
+    Args:
+        operation: Function to execute that may fail due to network issues
+        max_wait_seconds: Maximum time to wait between retries (default 60 seconds)
+        initial_delay: Initial delay between retries in seconds (default 1 second)
+        backoff_factor: Exponential backoff multiplier (default 2.0)
+    
+    Returns:
+        Result of the operation when it succeeds
+    """
+    delay = initial_delay
+    
+    while True:
+        try:
+            return operation()
+        except (
+            requests.exceptions.ConnectionError,
+            requests.exceptions.Timeout,
+            requests.exceptions.RequestException,
+            urllib3.exceptions.MaxRetryError,
+            urllib3.exceptions.NameResolutionError,
+            urllib3.exceptions.NewConnectionError,
+            GithubException,
+            OSError,  # Covers network-related OS errors
+        ) as e:
+            # Check if it's a network-related error
+            error_str = str(e).lower()
+            if any(keyword in error_str for keyword in [
+                'max retries exceeded', 'failed to resolve', 'connection', 
+                'network', 'timeout', 'nodename nor servname', 'temporary failure',
+                'name resolution', 'no route to host'
+            ]):
+                print(f"\r  Network error: {type(e).__name__}: {str(e)[:100]}...")
+                print(f"  Retrying in {delay:.1f} seconds...")
+                time.sleep(delay)
+                delay = min(delay * backoff_factor, max_wait_seconds)
+                continue
+            else:
+                # Re-raise non-network errors
+                raise
 
 # -------------------------
 # Local git helpers
@@ -316,7 +367,8 @@ def main():
             
         print(f"[Contributors] {repo.name}")
         contributors_rows = []
-        for contributor in repo.get_contributors():
+        contributors = retry_network_operation(lambda: list(repo.get_contributors()))
+        for contributor in contributors:
             contributors_rows.append({
                 "repo": repo.full_name,
                 "login": contributor.login if contributor else None,
@@ -333,7 +385,8 @@ def main():
             
         print(f"[Branches] {repo.name}")
         branches_rows = []
-        for branch in repo.get_branches():
+        branches = retry_network_operation(lambda: list(repo.get_branches()))
+        for branch in branches:
             branches_rows.append({
                 "repo": repo.full_name,
                 "branch": branch.name,
@@ -451,8 +504,8 @@ def main():
         pulls_rows = []
         pr_comments_rows = []
         
-        # Fetch PRs once and use for both datasets
-        prs = list(repo.get_pulls(state='all'))
+        # Fetch PRs once and use for both datasets with retry logic
+        prs = retry_network_operation(lambda: list(repo.get_pulls(state='all')))
         total_prs = len(prs)
         print(f"  Found {total_prs} PRs to process")
         
@@ -468,8 +521,9 @@ def main():
                 "files_impacted": getattr(pr, "changed_files", None)
             })
             
-            # Collect PR comments
-            for comment in pr.get_issue_comments():
+            # Collect PR comments with retry logic
+            issue_comments = retry_network_operation(lambda: list(pr.get_issue_comments()))
+            for comment in issue_comments:
                 pr_comments_rows.append({
                     "repo": repo.full_name,
                     "pull_number": pr.number,
@@ -477,7 +531,9 @@ def main():
                     "created_at": comment.created_at,
                     "type": "issue"
                 })
-            for review_comment in pr.get_review_comments():
+            
+            review_comments = retry_network_operation(lambda: list(pr.get_review_comments()))
+            for review_comment in review_comments:
                 pr_comments_rows.append({
                     "repo": repo.full_name,
                     "pull_number": pr.number,
@@ -502,7 +558,8 @@ def main():
             
         print(f"[Issues] {repo.name}")
         issues_rows = []
-        for issue in repo.get_issues(state='all'):
+        issues = retry_network_operation(lambda: list(repo.get_issues(state='all')))
+        for issue in issues:
             issues_rows.append({
                 "repo": repo.full_name,
                 "number": issue.number,
@@ -525,8 +582,10 @@ def main():
             
         print(f"[Issue Comments] {repo.name}")
         issue_comments_rows = []
-        for issue in repo.get_issues(state='all'):
-            for comment in issue.get_comments():
+        issues = retry_network_operation(lambda: list(repo.get_issues(state='all')))
+        for issue in issues:
+            comments = retry_network_operation(lambda: list(issue.get_comments()))
+            for comment in comments:
                 issue_comments_rows.append({
                     "repo": repo.full_name,
                     "issue_number": issue.number,

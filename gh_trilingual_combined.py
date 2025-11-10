@@ -6,12 +6,63 @@ import json
 import subprocess
 import time
 from collections import defaultdict
-from typing import Dict, List, Tuple, Iterable
+from typing import Dict, List, Tuple, Iterable, Callable, Any
 
 import pandas as pd
 from github import Github
+from github.GithubException import GithubException
+import requests.exceptions
+import urllib3.exceptions
 
 from extractor_trilingual import GitCommitAnalyzer
+
+# -------------------------
+# Network retry utilities
+# -------------------------
+
+def retry_network_operation(operation: Callable, max_wait_seconds: int = 60, initial_delay: float = 1.0, backoff_factor: float = 2.0) -> Any:
+    """
+    Retry a network operation with exponential backoff until it succeeds.
+    
+    Args:
+        operation: Function to execute that may fail due to network issues
+        max_wait_seconds: Maximum time to wait between retries (default 60 seconds)
+        initial_delay: Initial delay between retries in seconds (default 1 second)
+        backoff_factor: Exponential backoff multiplier (default 2.0)
+    
+    Returns:
+        Result of the operation when it succeeds
+    """
+    delay = initial_delay
+    
+    while True:
+        try:
+            return operation()
+        except (
+            requests.exceptions.ConnectionError,
+            requests.exceptions.Timeout,
+            requests.exceptions.RequestException,
+            urllib3.exceptions.MaxRetryError,
+            urllib3.exceptions.NameResolutionError,
+            urllib3.exceptions.NewConnectionError,
+            GithubException,
+            OSError,  # Covers network-related OS errors
+        ) as e:
+            # Check if it's a network-related error
+            error_str = str(e).lower()
+            if any(keyword in error_str for keyword in [
+                'max retries exceeded', 'failed to resolve', 'connection', 
+                'network', 'timeout', 'nodename nor servname', 'temporary failure',
+                'name resolution', 'no route to host'
+            ]):
+                print(f"\r  Network error: {type(e).__name__}: {str(e)[:100]}...")
+                print(f"  Retrying in {delay:.1f} seconds...")
+                time.sleep(delay)
+                delay = min(delay * backoff_factor, max_wait_seconds)
+                continue
+            else:
+                # Re-raise non-network errors
+                raise
 
 # -------------------------
 # Local git helpers
@@ -116,8 +167,31 @@ def parse_name_status(repo_path: str, sha: str):
             })
     return changed
 
-def get_all_commit_data(repo_path: str, commits: List[str]) -> Dict[str, Dict]:
-    """Get all commit data in three batched git calls instead of 3*N calls per commit."""
+# Batch size constant for processing commits
+COMMIT_BATCH_SIZE = 1000
+
+def get_commit_data_chunked(repo_path: str, commits: List[str]) -> Dict[str, Dict]:
+    """Get all commit data in chunked batches to avoid 'Argument list too long' errors."""
+    if not commits:
+        return {}
+    
+    all_results = {}
+    total_commits = len(commits)
+    
+    # Process commits in chunks
+    for i in range(0, total_commits, COMMIT_BATCH_SIZE):
+        chunk = commits[i:i + COMMIT_BATCH_SIZE]
+        chunk_end = min(i + COMMIT_BATCH_SIZE, total_commits)
+        print(f"\r    processing batch {i//COMMIT_BATCH_SIZE + 1}/{(total_commits + COMMIT_BATCH_SIZE - 1)//COMMIT_BATCH_SIZE} (commits {i+1}-{chunk_end})...", end="", flush=True)
+        
+        chunk_results = get_single_batch_commit_data(repo_path, chunk)
+        all_results.update(chunk_results)
+    
+    print()  # New line after batch processing
+    return all_results
+
+def get_single_batch_commit_data(repo_path: str, commits: List[str]) -> Dict[str, Dict]:
+    """Get commit data for a single batch of commits."""
     if not commits:
         return {}
     
@@ -284,47 +358,80 @@ def main():
     } for repo in repos]
     pd.DataFrame(repo_rows).to_csv(os.path.join(output_folder, "repositories.csv"), index=False)
 
-    # contributors.csv
-    contributors_rows = []
+    # contributors.csv (per-repo)
     for repo in repos:
+        contributors_file = os.path.join(output_folder, f"{repo.name}_contributors.csv")
+        if os.path.exists(contributors_file):
+            print(f"[Contributors] {repo.name} - output file already exists, skipping: {contributors_file}")
+            continue
+            
         print(f"[Contributors] {repo.name}")
-        for contributor in repo.get_contributors():
+        contributors_rows = []
+        contributors = retry_network_operation(lambda: list(repo.get_contributors()))
+        for contributor in contributors:
             contributors_rows.append({
                 "repo": repo.full_name,
                 "login": contributor.login if contributor else None,
                 "contributions": getattr(contributor, "contributions", None)
             })
-    pd.DataFrame(contributors_rows).to_csv(os.path.join(output_folder, "contributors.csv"), index=False)
+        pd.DataFrame(contributors_rows).to_csv(contributors_file, index=False)
 
-    # branches.csv (reference)
-    branches_rows = []
+    # branches.csv (per-repo)
     for repo in repos:
+        branches_file = os.path.join(output_folder, f"{repo.name}_branches.csv")
+        if os.path.exists(branches_file):
+            print(f"[Branches] {repo.name} - output file already exists, skipping: {branches_file}")
+            continue
+            
         print(f"[Branches] {repo.name}")
-        for branch in repo.get_branches():
+        branches_rows = []
+        branches = retry_network_operation(lambda: list(repo.get_branches()))
+        for branch in branches:
             branches_rows.append({
                 "repo": repo.full_name,
                 "branch": branch.name,
                 "commit_sha": branch.commit.sha
             })
-    pd.DataFrame(branches_rows).to_csv(os.path.join(output_folder, "branches.csv"), index=False)
+        pd.DataFrame(branches_rows).to_csv(branches_file, index=False)
 
-    # commits.csv (local git, de-duped, ALL refs)
-    commits_rows = []
+    # commits.csv (per-repo, local git, de-duped, ALL refs)
     for repo in repos:
+        commits_file = os.path.join(output_folder, f"{repo.name}_commits.csv")
+        if os.path.exists(commits_file):
+            print(f"[Commits: local git] {repo.name} - output file already exists, skipping: {commits_file}")
+            continue
+            
         print(f"[Commits: local git] {repo.name}")
+        commits_rows = []
         try:
             repo_path = ensure_local_clone(repo.name, repo.clone_url, local_root, token=GITHUB_TOKEN)
 
+            # Check if repository is empty (has no commits)
+            try:
+                run(["git", "rev-parse", "HEAD"], cwd=repo_path)
+            except RuntimeError:
+                print(f"  repository is empty (no commits), skipping")
+                continue
+
             local_branches = list_all_branches(repo_path)
             if not local_branches:
-                run(["git", "checkout", repo.default_branch], cwd=repo_path)
-                local_branches = list_all_branches(repo_path)
+                try:
+                    run(["git", "checkout", repo.default_branch], cwd=repo_path)
+                    local_branches = list_all_branches(repo_path)
+                except RuntimeError:
+                    print(f"  failed to checkout default branch '{repo.default_branch}', repository may be empty")
+                    continue
 
             branch_map, all_commits = commits_by_branch(repo_path, local_branches)
+            
+            # Double-check: if no commits found, skip
+            if not all_commits:
+                print(f"  no commits found in repository, skipping")
+                continue
 
-            # Batch process all commit data 
-            print(f"  processing {len(all_commits)} commits in batch...")
-            commit_data = get_all_commit_data(repo_path, all_commits)
+            # Batch process all commit data in chunks
+            print(f"  processing {len(all_commits)} commits in batches of {COMMIT_BATCH_SIZE}...")
+            commit_data = get_commit_data_chunked(repo_path, all_commits)
             
             individual_calls = 0
             for i, sha in enumerate(all_commits, 1):
@@ -377,22 +484,33 @@ def main():
             
             # Complete the progress line
             print()  # newline after carriage return progress
+            
+            # Save per-repo commits file
+            pd.DataFrame(commits_rows).to_csv(commits_file, index=False)
         except Exception as e:
             print(f"  failed on repo {repo.name}: {e}")
             continue
 
-    pd.DataFrame(commits_rows).to_csv(os.path.join(output_folder, "commits.csv"), index=False)
-
-    # pull_requests.csv and pr_comments.csv (combined to avoid duplicate API calls)
-    pulls_rows = []
-    pr_comments_rows = []
-    
+    # pull_requests.csv and pr_comments.csv (per-repo, combined to avoid duplicate API calls)
     for repo in repos:
-        print(f"[Pull Requests & Comments] {repo.name}")
-        # Fetch PRs once and use for both datasets
-        prs = list(repo.get_pulls(state='all'))
+        pulls_file = os.path.join(output_folder, f"{repo.name}_pull_requests.csv")
+        pr_comments_file = os.path.join(output_folder, f"{repo.name}_pr_comments.csv")
         
-        for pr in prs:
+        if os.path.exists(pulls_file) and os.path.exists(pr_comments_file):
+            print(f"[Pull Requests & Comments] {repo.name} - output files already exist, skipping: {pulls_file}, {pr_comments_file}")
+            continue
+            
+        print(f"[Pull Requests & Comments] {repo.name}")
+        pulls_rows = []
+        pr_comments_rows = []
+        
+        # Fetch PRs once and use for both datasets with retry logic
+        prs = retry_network_operation(lambda: list(repo.get_pulls(state='all')))
+        total_prs = len(prs)
+        print(f"  Found {total_prs} PRs to process")
+        
+        for i, pr in enumerate(prs, 1):
+            print(f"\r  processed {i}/{total_prs} PRs...", end="", flush=True)
             # Collect PR data
             pulls_rows.append({
                 "repo": repo.full_name,
@@ -403,8 +521,9 @@ def main():
                 "files_impacted": getattr(pr, "changed_files", None)
             })
             
-            # Collect PR comments
-            for comment in pr.get_issue_comments():
+            # Collect PR comments with retry logic
+            issue_comments = retry_network_operation(lambda: list(pr.get_issue_comments()))
+            for comment in issue_comments:
                 pr_comments_rows.append({
                     "repo": repo.full_name,
                     "pull_number": pr.number,
@@ -412,7 +531,9 @@ def main():
                     "created_at": comment.created_at,
                     "type": "issue"
                 })
-            for review_comment in pr.get_review_comments():
+            
+            review_comments = retry_network_operation(lambda: list(pr.get_review_comments()))
+            for review_comment in review_comments:
                 pr_comments_rows.append({
                     "repo": repo.full_name,
                     "pull_number": pr.number,
@@ -421,15 +542,24 @@ def main():
                     "position": review_comment.position,
                     "type": "review"
                 })
-    
-    pd.DataFrame(pulls_rows).to_csv(os.path.join(output_folder, "pull_requests.csv"), index=False)
-    pd.DataFrame(pr_comments_rows).to_csv(os.path.join(output_folder, "pr_comments.csv"), index=False)
+        
+        print()  # New line after progress tracking
+        
+        # Save per-repo files
+        pd.DataFrame(pulls_rows).to_csv(pulls_file, index=False)
+        pd.DataFrame(pr_comments_rows).to_csv(pr_comments_file, index=False)
 
-    # issues.csv
-    issues_rows = []
+    # issues.csv (per-repo)
     for repo in repos:
+        issues_file = os.path.join(output_folder, f"{repo.name}_issues.csv")
+        if os.path.exists(issues_file):
+            print(f"[Issues] {repo.name} - output file already exists, skipping: {issues_file}")
+            continue
+            
         print(f"[Issues] {repo.name}")
-        for issue in repo.get_issues(state='all'):
+        issues_rows = []
+        issues = retry_network_operation(lambda: list(repo.get_issues(state='all')))
+        for issue in issues:
             issues_rows.append({
                 "repo": repo.full_name,
                 "number": issue.number,
@@ -441,32 +571,43 @@ def main():
                 "created_at": issue.created_at,
                 "closed_at": issue.closed_at
             })
-    pd.DataFrame(issues_rows).to_csv(os.path.join(output_folder, "issues.csv"), index=False)
+        pd.DataFrame(issues_rows).to_csv(issues_file, index=False)
 
-    # issue_comments.csv
-    issue_comments_rows = []
+    # issue_comments.csv (per-repo)
     for repo in repos:
+        issue_comments_file = os.path.join(output_folder, f"{repo.name}_issue_comments.csv")
+        if os.path.exists(issue_comments_file):
+            print(f"[Issue Comments] {repo.name} - output file already exists, skipping: {issue_comments_file}")
+            continue
+            
         print(f"[Issue Comments] {repo.name}")
-        for issue in repo.get_issues(state='all'):
-            for comment in issue.get_comments():
+        issue_comments_rows = []
+        issues = retry_network_operation(lambda: list(repo.get_issues(state='all')))
+        for issue in issues:
+            comments = retry_network_operation(lambda: list(issue.get_comments()))
+            for comment in comments:
                 issue_comments_rows.append({
                     "repo": repo.full_name,
                     "issue_number": issue.number,
                     "user.login": comment.user.login if comment.user else None,
                     "created_at": comment.created_at
                 })
-    pd.DataFrame(issue_comments_rows).to_csv(os.path.join(output_folder, "issue_comments.csv"), index=False)
+        pd.DataFrame(issue_comments_rows).to_csv(issue_comments_file, index=False)
 
-    # dependency analysis (local, reuses analyzer)
-    for repo in repos:
-        print(f"[Dependency Analysis] {repo.name}")
-        analyzer = GitCommitAnalyzer(repo.clone_url)
-        try:
-            results = analyzer.analyze_all_commits()
-            dep_file = os.path.join(output_folder, f"{repo.name}_deps.json")
-            analyzer.save_results(results, dep_file)
-        except Exception as e:
-            print(f"Dependency analysis failed for {repo.name}: {e}")
+    # dependency analysis (per-repo, local, reuses analyzer) - COMMENTED OUT, using separate monthly script
+    # for repo in repos:
+    #     dep_file = os.path.join(output_folder, f"{repo.name}_deps.json")
+    #     if os.path.exists(dep_file):
+    #         print(f"[Dependency Analysis] {repo.name} - output file already exists, skipping: {dep_file}")
+    #         continue
+    #         
+    #     print(f"[Dependency Analysis] {repo.name}")
+    #     analyzer = GitCommitAnalyzer(repo.clone_url)
+    #     try:
+    #         results = analyzer.analyze_all_commits()
+    #         analyzer.save_results(results, dep_file)
+    #     except Exception as e:
+    #         print(f"Dependency analysis failed for {repo.name}: {e}")
     
     # Print elapsed time
     end_time = time.time()
